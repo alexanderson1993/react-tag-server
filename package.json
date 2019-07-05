@@ -1,0 +1,22 @@
+{
+  "name": "react-tag-server",
+  "description": "",
+  "dependencies": {
+    "apollo-datasource-rest": "latest",
+    "apollo-server": "2.1.0",
+    "firebase-admin": "8.2.0",
+    "graphql": "14.0.2",
+    "graphql-type-json": "0.3.0",
+    "random-words": "1.1.0"
+  },
+  "license": "MIT",
+  "main": "index.js",
+  "scripts": {
+    "start": "nodemon index.js localhost 4000"
+  },
+  "keywords": [],
+  "devDependencies": {
+    "@types/graphql": "14.0.1",
+    "nodemon": "1.18.4"
+  }
+}
