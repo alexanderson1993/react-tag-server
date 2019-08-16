@@ -1,6 +1,6 @@
 const { gql, UserInputError } = require("apollo-server-express");
 const pubsub = require("../helpers/pubsub");
-const { firestore } = require("../connectors/firebase");
+const dbPromise = require("../connectors/sqlite");
 const randomWords = require("random-words");
 const { withFilter } = require("apollo-server");
 
@@ -12,7 +12,7 @@ function shuffle(array) {
 // necessary for the functionality in this file.
 module.exports.schema = gql`
   type Game {
-    id: ID!
+    game_id: ID!
     name: String!
     code: String!
     owner: User
@@ -60,176 +60,202 @@ const NOTIFICATION = "NOTIFICATION";
 module.exports.resolver = {
   Query: {
     async games(_, __, context) {
-      const games = await firestore()
-        .collection("games")
-        .where("players", "array-contains", context.user.uid)
-        .get();
-      return games.docs.map(d => ({ id: d.id, ...d.data() }));
+      const db = await dbPromise;
+
+      return db.all(
+        `SELECT * FROM game WHERE game_id in (SELECT game_id FROM game_user WHERE user_id = $id)`,
+        { $id: context.user.user_id }
+      );
     },
     async game(_, { gameId, code }, context) {
+      const db = await dbPromise;
+      console.log(gameId, code);
       if (code) {
-        const games = await firestore()
-          .collection("games")
-          .where("code", "==", code)
-          .get();
-        const game = games.docs[0];
-        if (!game) return null;
-        return { id: game.id, ...game.data() };
+        return db.get(`SELECT * FROM game WHERE code = $code`, {
+          $code: code
+        });
       }
-      const game = await firestore()
-        .collection("games")
-        .doc(gameId)
-        .get();
-      const data = game.data();
-      if (data.players && data.players.includes(context.user.uid))
-        return { id: game.id, ...data };
-      return null;
+      return db.get(`SELECT * FROM game WHERE game_id = $id`, {
+        $id: gameId
+      });
     }
   },
   Mutation: {
     async createGame(_, { name, description }, context) {
+      const db = await dbPromise;
+
       const game = {
-        name,
-        description,
-        code: randomWords(2)
+        $name: name,
+        $description: description,
+        $code: randomWords(2)
           .join("-")
           .toLowerCase(),
-        owner: context.user.uid,
-        started: false,
-        completed: false,
-        players: [context.user.uid],
-        playerCount: 1,
-        aliveCount: 1
+        $owner_id: context.user.user_id,
+        $started: false,
+        $completed: false
       };
-      const gameObj = await firestore()
-        .collection("games")
-        .add(game);
-      const data = await gameObj.get();
-      return { id: data.id, ...data.data() };
+      const {
+        stmt: { lastID }
+      } = await db.run(
+        `INSERT INTO game (name, description, code, owner_id, started, completed) VALUES ($name,
+            $description,
+            $code,
+            $owner_id,
+            $started,
+            $completed)`,
+        game
+      );
+      return db.get(`SELECT * FROM game WHERE game_id = $lastID`, {
+        $lastID: lastID
+      });
     },
     async joinGame(_, { code }, context) {
-      const games = await firestore()
-        .collection("games")
-        .where("code", "==", code.toLowerCase())
-        .get();
-      const game = games.docs[0];
+      const db = await dbPromise;
+
+      const game = await db.get(`SELECT * FROM game WHERE code = $code`, {
+        $code: code
+      });
       if (!game) throw new UserInputError("Invalid game code.");
       if (game.started)
         throw new UserInputError("Cannot join game that has already started.");
 
-      const data = game.data();
-      const players = data.players || [];
+      const players = await db.all(
+        `SELECT * FROM game_user WHERE game_id = $gameID`,
+        { $gameID: game.game_id }
+      );
 
-      if (players.includes(context.user.uid)) {
+      if (players.find(({ user_id }) => user_id === context.user.user_id)) {
         throw new UserInputError("Already part of this game.");
       }
-      const playerCount = data.playerCount;
-      const aliveCount = data.aliveCount;
 
-      players.push(context.user.uid);
-      await game.ref.update({
-        players,
-        playerCount: playerCount + 1,
-        aliveCount: aliveCount + 1
-      });
-      const updatedGame = await game.ref.get();
-      pubsub.publish(GAME_UPDATE, {
-        id: updatedGame.id,
-        ...updatedGame.data()
-      });
+      await db.run(
+        `INSERT INTO game_user (game_id, user_id) VALUES ($game_id, $user_id)`,
+        { $game_id: game.game_id, $user_id: context.user.user_id }
+      );
 
-      return { id: updatedGame.id, ...updatedGame.data() };
+      pubsub.publish(GAME_UPDATE, game);
+
+      return game;
     },
     async startGame(_, { gameId }, context) {
-      const game = await firestore()
-        .collection("games")
-        .doc(gameId)
-        .get();
+      const db = await dbPromise;
+
+      const game = await db.get(`SELECT * FROM game WHERE game_id = $gameId`, {
+        $gameId: gameId
+      });
+
       if (!game) throw new UserInputError("Invalid game id.");
-      const data = game.data();
-      if (data.owner !== context.user.uid)
+      if (data.owner_id !== context.user.user_id)
         throw new UserInputError("Must own game to start.");
-      if (data.playerCount < 3)
+
+      const players = await db.all(
+        `SELECT * FROM game_user WHERE game_id = $gameID`,
+        { $gameID: game.game_id }
+      );
+
+      if (players.length < 3)
         throw new UserInputError("Must have at least 5 players to start.");
 
-      let players = data.players.concat();
+      let playerList = data.players.concat();
 
       const targets = {};
-      let targetPlayer = players.pop();
+      let targetPlayer = playerList.pop();
       let firstPlayer = targetPlayer;
-      while (players.length > 0) {
-        shuffle(players);
-        const newPlayer = players.pop();
+      while (playerList.length > 0) {
+        shuffle(playerList);
+        const newPlayer = playerList.pop();
         targets[targetPlayer] = newPlayer;
         targetPlayer = newPlayer;
       }
       targets[targetPlayer] = firstPlayer;
-      const update = {
-        started: true,
-        startTime: new Date(),
-        targets
-      };
 
-      const message = `The game ${data.name} has started.`;
-      pubsub.publish(NOTIFICATION, { game: data, message });
+      // Push the updated values to the database
+      await Promise.all(
+        Object.entries(targets).map(([$userId, $targetId]) => {
+          db.run(
+            `UPDATE game_user SET target_id = $targetId WHERE game_id = $gameId AND user_id = $userId`,
+            { $targetId, $userId, $gameId: game.game_id }
+          );
+        })
+      );
 
-      await game.ref.update(update);
-      const gameUpdateData = await game.ref.get();
-      pubsub.publish(GAME_UPDATE, {
-        id: gameUpdateData.id,
-        ...gameUpdateData.data()
-      });
+      await db.run(
+        `UPDATE game SET started = 1, startTime = $startTime WHERE game_id = $gameId`,
+        { $gameId: game.game_id, startTime: Date.now() }
+      );
 
-      return { id: gameUpdateData.id, ...gameUpdateData.data() };
+      const message = `The game ${game.name} has started.`;
+      pubsub.publish(NOTIFICATION, { game, message });
+      const gameUpdateData = db.get(
+        `SELECT * FROM game WHERE game_id = $gameId`,
+        {
+          $gameId: gameId
+        }
+      );
+      pubsub.publish(GAME_UPDATE, gameUpdateData);
+
+      return gameUpdateData;
     },
     async surrender(_, { gameId }, context) {
-      const game = await firestore()
-        .collection("games")
-        .doc(gameId)
-        .get();
+      const db = await dbPromise;
+
+      const game = await db.get(`SELECT * FROM game WHERE game_id = $gameId`, {
+        $gameId: gameId
+      });
       if (!game) throw new UserInputError("Invalid game id.");
-      const data = game.data();
-      if (!data.players.includes(context.user.uid))
+      const player = await db.get(
+        `SELECT * FROM game_user WHERE game_id = $gameID AND user_id = $userID`,
+        { $gameID: game.game_id, $userID: context.user.user_id }
+      );
+
+      if (!player)
         throw new UserInputError(
           "Can't surrender to a game you aren't part of."
         );
-      const { [context.user.uid]: playerTarget, ...targets } = data.targets;
-      const [enemyId] = Object.entries(targets).find(
-        ([enemyId, playerId]) => playerId === context.user.uid
+
+      await db.run(
+        `UPDATE game_user SET target_id = $targetId WHERE target_id = $userId`,
+        { $targetId: player.target_id, userId: context.user.user_id }
+      );
+      await db.run(
+        `UPDATE game_user SET target_id = NULL WHERE user_id = $userId`,
+        { userId: context.user.user_id }
       );
 
-      const update = {
-        aliveCount: data.aliveCount - 1,
-        targets: { ...targets, [enemyId]: playerTarget }
-      };
-      const enemyPlayer = await firestore()
-        .collection("users")
-        .doc(enemyId)
-        .get();
+      const enemy = await db.get(
+        "SELECT * FROM game_user WHERE game_id = $gameID"
+      );
+      const enemyData = await db.get(
+        `SELECT * FROM user WHERE user_id = $enemyId`,
+        { $enemyId: enemy.user_id }
+      );
 
-      if (enemyId === playerTarget) {
+      if (enemy.user_id === enemy.target_id) {
         // We have a winner!
-        update.completed = true;
-        update.winner = enemyId;
+        await db.run(
+          `UPDATE game SET completed = 1, winner = $enemyId WHERE game_id = $gameId`,
+          { $gameId: game.game_id, $enemyId: enemy.user_id }
+        );
 
-        const message = `${enemyPlayer.data().displayName} won the game "${
-          data.name
-        }"!`;
-        pubsub.publish(NOTIFICATION, { game: data, message });
+        const message = `${enemyData.name} won the game "${game.name}"!`;
+        pubsub.publish(NOTIFICATION, { game, message });
       } else {
-        const currentPlayer = await firestore()
-          .collection("users")
-          .doc(context.user.uid)
-          .get();
+        const currentPlayer = await db.get(
+          `SELECT * FROM user WHERE user_id = $userId`,
+          { $userId: context.user.user_id }
+        );
 
-        const message = `${enemyPlayer.data().displayName} has eliminated ${
-          currentPlayer.data().displayName
+        const message = `${enemyData.ame} has eliminated ${
+          currentPlayer.name
         }.`;
-        pubsub.publish(NOTIFICATION, { game: data, message });
+        pubsub.publish(NOTIFICATION, { game, message });
       }
-      await game.ref.update(update);
-      const updatedGame = await game.ref.get();
-      const updatedGameData = { id: updatedGame.id, ...updatedGame.data() };
+      const updatedGameData = await db.get(
+        `SELECT * FROM game WHERE game_id = $gameId`,
+        {
+          $gameId: gameId
+        }
+      );
       pubsub.publish(GAME_UPDATE, updatedGameData);
 
       return updatedGameData;
@@ -238,15 +264,19 @@ module.exports.resolver = {
   Subscription: {
     gameUpdate: {
       resolve(payload) {
-        console.log(payload);
         return payload;
       },
       subscribe: withFilter(
         () => pubsub.asyncIterator([GAME_UPDATE]),
-        (payload, variables, context) => {
+        async (payload, variables, context) => {
+          const db = await dbPromise;
+          const players = await db.all(
+            `SELECT * FROM game_user WHERE game_id = $gameID`,
+            { $gameID: payload.game_id }
+          );
           return (
-            payload.id === variables.gameId ||
-            payload.players.includes(context.user.uid)
+            payload.game_id === variables.gameId ||
+            players.includes(context.user.user_id)
           );
         }
       )
@@ -257,61 +287,95 @@ module.exports.resolver = {
       },
       subscribe: withFilter(
         () => pubsub.asyncIterator([NOTIFICATION]),
-        (payload, variables, context) => {
-          return payload.game.players.includes(context.user.uid);
+        async (payload, variables, context) => {
+          const db = await dbPromise;
+
+          const players = await db.all(
+            `SELECT * FROM game_user WHERE game_id = $gameID`,
+            { $gameID: payload.game.game_id }
+          );
+          return players.includes(context.user.user_id);
         }
       )
     }
   },
   Game: {
     async owner(game) {
-      const user = await firestore()
-        .collection("users")
-        .doc(game.owner)
-        .get();
-      return { id: user.id, ...user.data() };
+      const db = await dbPromise;
+
+      return db.get(`SELECT * FROM user WHERE user_id = $owner`, {
+        $owner: game.owner_id
+      });
     },
     async winner(game, _, context) {
+      const db = await dbPromise;
+
       context.game = game;
       if (!game.winner) return null;
-      const user = await firestore()
-        .collection("users")
-        .doc(game.winner)
-        .get();
-      return { id: user.id, ...user.data() };
+      return db.get(`SELECT * FROM user WHERE user_id = $winner`, {
+        $winner: game.winner_id
+      });
     },
     me(game, _, context) {
       context.game = game;
-      return context.user.uid;
+      return context.user.user_id;
     },
-    players(game, _, context) {
-      context.game = game;
-      return game.players;
+    async players(game, _, context) {
+      const db = await dbPromise;
+
+      const players = await db.all(
+        `SELECT * FROM game_user WHERE game_id = $gameID`,
+        { $gameID: game.game_id }
+      );
+      return players;
+    },
+    async playerCount(game) {
+      const db = await dbPromise;
+
+      const players = await db.all(
+        `SELECT * FROM game_user WHERE game_id = $gameID`,
+        { $gameID: game.game_id }
+      );
+      return players.length;
+    },
+    async aliveCount(game) {
+      const db = await dbPromise;
+
+      const players = await db.all(
+        `SELECT * FROM game_user WHERE game_id = $gameID AND target_id IS NOT NULL`,
+        { $gameID: game.game_id }
+      );
+      return players.length;
     }
   },
   Player: {
-    id(playerId) {
-      return playerId;
+    id({ user_id }) {
+      return user_id;
     },
     async user(playerId) {
-      const user = await firestore()
-        .collection("users")
-        .doc(playerId)
-        .get();
-      return { id: user.id, ...user.data() };
+      const db = await dbPromise;
+
+      return db.get(`SELECT * FROM user WHERE user_id = $id`, {
+        $id: playerId
+      });
     },
     async target(playerId, _, { game }) {
-      if (!game || !game.targets) return null;
-      const target = game.targets[playerId];
-      if (!target) return null;
+      const db = await dbPromise;
 
-      return target;
+      return db.get(
+        `SELECT * FROM game_user WHERE user_id = $id AND game_id = $gameId`,
+        { $id: playerId, $gameId: game.game_id }
+      );
     },
     async dead(playerId, _, { game }) {
+      const db = await dbPromise;
+
       if (!game) return false;
       if (!game.started) return false;
-      if (!game.targets[playerId]) return true;
-      return false;
+      return db.get(
+        `SELECT * FROM game_user WHERE target_id = $id AND game_id = $gameId`,
+        { $id: playerId, $gameId: game.game_id }
+      );
     }
   }
 };

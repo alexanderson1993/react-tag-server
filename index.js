@@ -1,6 +1,5 @@
-const { ApolloServer, gql } = require("apollo-server");
+const { ApolloServer } = require("apollo-server");
 const schema = require("./schema");
-const { auth } = require("./connectors/firebase");
 
 const server = new ApolloServer({
   schema,
@@ -14,13 +13,7 @@ const server = new ApolloServer({
     }
     if (!token) return { user: null };
 
-    try {
-      const user = await auth().verifyIdToken(token);
-      return { user };
-    } catch (error) {
-      console.error(error);
-      return {};
-    }
+    return { user: { user_id: token } };
   }
 });
 

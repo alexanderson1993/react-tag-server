@@ -1,11 +1,11 @@
 const { gql, AuthenticationError } = require("apollo-server-express");
-const { firestore } = require("../connectors/firebase");
+const dbPromise = require("../connectors/sqlite");
 // We define a schema that encompasses all of the types
 // necessary for the functionality in this file.
 module.exports.schema = gql`
   type User {
-    id: ID!
-    displayName: String!
+    user_id: ID!
+    name: String!
     photoURL: String
     games: [Game]
   }
@@ -16,7 +16,7 @@ module.exports.schema = gql`
   }
 
   extend type Mutation {
-    createUser(displayName: String!, photoURL: String): User
+    createUser(name: String!, photoURL: String): User
   }
 `;
 
@@ -25,27 +25,26 @@ module.exports.schema = gql`
 // deep merged with the other resolvers.
 module.exports.resolver = {
   Query: {
-    me(_, __, context) {
-      return firestore()
-        .collection("users")
-        .doc(context.user.uid)
-        .get();
+    async me(_, __, context) {
+      const db = await dbPromise;
+
+      return db.get(`SELECT * FROM user WHERE user_id = $id`, {
+        $id: context.user.user_id
+      });
     }
   },
   Mutation: {
-    async createUser(_, { displayName, photoURL }, context) {
+    async createUser(_, { name, photoURL }, context) {
       if (!context.user)
         throw new AuthenticationError(
           "Must be logged in to create user reference."
         );
-      await firestore()
-        .collection("users")
-        .doc(context.user.uid)
-        .set({
-          id: context.user.uid,
-          displayName,
-          photoURL
-        });
+      const db = await dbPromise;
+
+      await db.run(
+        `INSERT INTO user (name, photoURL) VALUES ($name, $photoURL)`,
+        { $name: name, $photoURL: photoURL }
+      );
       return {
         id: context.user.uid,
         displayName,
@@ -55,11 +54,12 @@ module.exports.resolver = {
   },
   User: {
     async games(user) {
-      const games = await firestore()
-        .collection("games")
-        .where("players", "array-contains", user.id)
-        .get();
-      return games.docs.map(d => ({ id: d.id, ...d.data() }));
+      const db = await dbPromise;
+
+      return db.all(
+        `SELECT * FROM game WHERE game_id in (SELECT game_id FROM game_user WHERE user_id = $id)`,
+        { $id: user.user_id }
+      );
     }
   }
 };
