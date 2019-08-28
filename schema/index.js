@@ -5,10 +5,13 @@ const { schema: ScalarSchema, resolver: ScalarResolver } = require("./scalars");
 const { schema: UserSchema, resolver: UserResolver } = require("./user");
 const { schema: GameSchema, resolver: GameResolver } = require("./game");
 
+const populateData = require("./populateData.js");
+
 const MainSchema = gql`
   type Query {
     # Types cannot be empty. Since we extend this type elsewhere,
     # we must add something to this type here.
+    populateData: String
     _empty: String
   }
   type Mutation {
@@ -21,7 +24,11 @@ const MainSchema = gql`
 
 // This resolver object can be extended if properties are added
 // to the Query and Mutation types above.
-const MainResolver = {};
+const MainResolver = {
+  Query: {
+    populateData
+  }
+};
 
 // We collect the schemas and resolvers from the different
 // functionally-separated files, and merge them together into

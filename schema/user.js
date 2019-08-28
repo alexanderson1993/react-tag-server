@@ -12,7 +12,7 @@ module.exports.schema = gql`
 
   # We can extend other graphQL types using the "extend" keyword.
   extend type Query {
-    me: User
+    me(user_id: ID!): User
   }
 
   extend type Mutation {
@@ -46,8 +46,8 @@ module.exports.resolver = {
         { $name: name, $photoURL: photoURL }
       );
       return {
-        id: context.user.uid,
-        displayName,
+        id: context.user.user_id,
+        name,
         photoURL
       };
     }

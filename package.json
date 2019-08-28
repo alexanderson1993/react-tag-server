@@ -2,11 +2,10 @@
   "name": "react-tag-server",
   "description": "",
   "dependencies": {
-    "apollo-datasource-rest": "latest",
     "apollo-server": "2.1.0",
-    "firebase-admin": "8.2.0",
     "graphql": "14.0.2",
     "graphql-type-json": "0.3.0",
+    "lodash": "^4.17.15",
     "random-words": "1.1.0",
     "sqlite": "^3.0.3"
   },

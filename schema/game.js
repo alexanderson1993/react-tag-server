@@ -61,15 +61,14 @@ module.exports.resolver = {
   Query: {
     async games(_, __, context) {
       const db = await dbPromise;
-
-      return db.all(
+      const data = await db.all(
         `SELECT * FROM game WHERE game_id in (SELECT game_id FROM game_user WHERE user_id = $id)`,
         { $id: context.user.user_id }
       );
+      return data;
     },
     async game(_, { gameId, code }, context) {
       const db = await dbPromise;
-      console.log(gameId, code);
       if (code) {
         return db.get(`SELECT * FROM game WHERE code = $code`, {
           $code: code
@@ -145,25 +144,23 @@ module.exports.resolver = {
       });
 
       if (!game) throw new UserInputError("Invalid game id.");
-      if (data.owner_id !== context.user.user_id)
+      if (game.owner_id !== context.user.user_id)
         throw new UserInputError("Must own game to start.");
 
-      const players = await db.all(
+      const playerList = await db.all(
         `SELECT * FROM game_user WHERE game_id = $gameID`,
         { $gameID: game.game_id }
       );
 
-      if (players.length < 3)
+      if (playerList.length < 3)
         throw new UserInputError("Must have at least 5 players to start.");
 
-      let playerList = data.players.concat();
-
       const targets = {};
-      let targetPlayer = playerList.pop();
+      let targetPlayer = playerList.pop().user_id;
       let firstPlayer = targetPlayer;
       while (playerList.length > 0) {
         shuffle(playerList);
-        const newPlayer = playerList.pop();
+        const newPlayer = playerList.pop().user_id;
         targets[targetPlayer] = newPlayer;
         targetPlayer = newPlayer;
       }
@@ -172,7 +169,7 @@ module.exports.resolver = {
       // Push the updated values to the database
       await Promise.all(
         Object.entries(targets).map(([$userId, $targetId]) => {
-          db.run(
+          return db.run(
             `UPDATE game_user SET target_id = $targetId WHERE game_id = $gameId AND user_id = $userId`,
             { $targetId, $userId, $gameId: game.game_id }
           );
@@ -180,13 +177,13 @@ module.exports.resolver = {
       );
 
       await db.run(
-        `UPDATE game SET started = 1, startTime = $startTime WHERE game_id = $gameId`,
-        { $gameId: game.game_id, startTime: Date.now() }
+        `UPDATE game SET started = 1, start_time = $startTime WHERE game_id = $gameId`,
+        { $gameId: game.game_id, $startTime: Date.now() }
       );
 
       const message = `The game ${game.name} has started.`;
       pubsub.publish(NOTIFICATION, { game, message });
-      const gameUpdateData = db.get(
+      const gameUpdateData = await db.get(
         `SELECT * FROM game WHERE game_id = $gameId`,
         {
           $gameId: gameId
@@ -203,27 +200,31 @@ module.exports.resolver = {
         $gameId: gameId
       });
       if (!game) throw new UserInputError("Invalid game id.");
-      const player = await db.get(
+      const surrenderingPlayer = await db.get(
         `SELECT * FROM game_user WHERE game_id = $gameID AND user_id = $userID`,
         { $gameID: game.game_id, $userID: context.user.user_id }
       );
 
-      if (!player)
+      if (!surrenderingPlayer)
         throw new UserInputError(
           "Can't surrender to a game you aren't part of."
         );
-
       await db.run(
-        `UPDATE game_user SET target_id = $targetId WHERE target_id = $userId`,
-        { $targetId: player.target_id, userId: context.user.user_id }
+        `UPDATE game_user SET target_id = $targetId WHERE target_id = $userId AND game_id = $gameId`,
+        {
+          $targetId: surrenderingPlayer.target_id,
+          $userId: context.user.user_id,
+          $gameId: gameId
+        }
       );
       await db.run(
-        `UPDATE game_user SET target_id = NULL WHERE user_id = $userId`,
-        { userId: context.user.user_id }
+        `UPDATE game_user SET target_id = NULL WHERE user_id = $userId and game_id = $gameId`,
+        { $userId: context.user.user_id, $gameId: gameId }
       );
 
       const enemy = await db.get(
-        "SELECT * FROM game_user WHERE game_id = $gameID"
+        "SELECT * FROM game_user WHERE game_id = $game_id AND target_id = $targetId",
+        { $game_id: gameId, $targetId: surrenderingPlayer.target_id }
       );
       const enemyData = await db.get(
         `SELECT * FROM user WHERE user_id = $enemyId`,
@@ -232,8 +233,11 @@ module.exports.resolver = {
 
       if (enemy.user_id === enemy.target_id) {
         // We have a winner!
+        await db.run(`UPDATE game SET completed = 1 WHERE game_id = $gameId`, {
+          $gameId: game.game_id
+        });
         await db.run(
-          `UPDATE game SET completed = 1, winner = $enemyId WHERE game_id = $gameId`,
+          `UPDATE game SET winner_id = $enemyId WHERE game_id = $gameId`,
           { $gameId: game.game_id, $enemyId: enemy.user_id }
         );
 
@@ -245,9 +249,7 @@ module.exports.resolver = {
           { $userId: context.user.user_id }
         );
 
-        const message = `${enemyData.ame} has eliminated ${
-          currentPlayer.name
-        }.`;
+        const message = `${enemyData.name} has eliminated ${currentPlayer.name}.`;
         pubsub.publish(NOTIFICATION, { game, message });
       }
       const updatedGameData = await db.get(
@@ -275,7 +277,7 @@ module.exports.resolver = {
             { $gameID: payload.game_id }
           );
           return (
-            payload.game_id === variables.gameId ||
+            String(payload.game_id) === String(variables.gameId) ||
             players.includes(context.user.user_id)
           );
         }
@@ -291,10 +293,16 @@ module.exports.resolver = {
           const db = await dbPromise;
 
           const players = await db.all(
-            `SELECT * FROM game_user WHERE game_id = $gameID`,
+            `SELECT user_id FROM game_user WHERE game_id = $gameID`,
             { $gameID: payload.game.game_id }
           );
-          return players.includes(context.user.user_id);
+          return Boolean(
+            players.find(
+              p =>
+                String(p.user_id) ===
+                String(context.user.user_id).replace(/"/gi, "")
+            )
+          );
         }
       )
     }
@@ -311,7 +319,7 @@ module.exports.resolver = {
       const db = await dbPromise;
 
       context.game = game;
-      if (!game.winner) return null;
+      if (!game.winner_id) return null;
       return db.get(`SELECT * FROM user WHERE user_id = $winner`, {
         $winner: game.winner_id
       });
@@ -349,33 +357,34 @@ module.exports.resolver = {
     }
   },
   Player: {
-    id({ user_id }) {
-      return user_id;
+    id(user) {
+      return user && user.user_id ? user.user_id : user;
     },
     async user(playerId) {
       const db = await dbPromise;
-
+      const id = playerId.user_id ? playerId.user_id : playerId;
       return db.get(`SELECT * FROM user WHERE user_id = $id`, {
-        $id: playerId
+        $id: id
       });
     },
     async target(playerId, _, { game }) {
       const db = await dbPromise;
-
+      const id = playerId.replace(/"/gi, "");
       return db.get(
-        `SELECT * FROM game_user WHERE user_id = $id AND game_id = $gameId`,
-        { $id: playerId, $gameId: game.game_id }
+        `SELECT * FROM game_user WHERE user_id = (SELECT target_id FROM game_user WHERE user_id = $id AND game_id = $gameId) AND game_id = $gameId`,
+        { $id: id, $gameId: game.game_id }
       );
     },
     async dead(playerId, _, { game }) {
       const db = await dbPromise;
-
       if (!game) return false;
       if (!game.started) return false;
-      return db.get(
+      const id = playerId.replace(/"/gi, "");
+      const player = await db.get(
         `SELECT * FROM game_user WHERE target_id = $id AND game_id = $gameId`,
-        { $id: playerId, $gameId: game.game_id }
+        { $id: id, $gameId: game.game_id }
       );
+      return !player;
     }
   }
 };
