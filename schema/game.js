@@ -48,7 +48,7 @@ module.exports.schema = gql`
 
   extend type Subscription {
     gameUpdate(gameId: ID, playerId: ID): Game
-    notification(playerId: ID!): String
+    notification: String
   }
 `;
 
